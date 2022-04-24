@@ -138,7 +138,7 @@ class MLPRender(torch.nn.Module):
 class TensorBase(torch.nn.Module):
     def __init__(self, aabb, gridSize, device, density_n_comp = 8, appearance_n_comp = 24, app_dim = 27,
                     shadingMode = 'MLP_PE', alphaMask = None, near_far=[2.0,6.0],
-                    density_shift = -10, alphaMask_thres=0.001, distance_scale=25, rayMarch_weight_thres=0.0001,
+                    density_shift = -10, alphaMask_thres=0.08, distance_scale=25, rayMarch_weight_thres=0.0001,
                     pos_pe = 6, view_pe = 6, fea_pe = 6, featureC=128, step_ratio=2.0,
                     fea2denseAct = 'softplus'):
         super(TensorBase, self).__init__()
@@ -191,6 +191,7 @@ class TensorBase(torch.nn.Module):
         print(self.renderModule)
 
     def update_stepSize(self, gridSize):
+        print("aabb raw",self.aabb)
         print("aabb", self.aabb.view(-1))
         print("grid size", gridSize)
         self.aabbSize = self.aabb[1] - self.aabb[0]
@@ -300,8 +301,9 @@ class TensorBase(torch.nn.Module):
         pass
 
     @torch.no_grad()
-    def getDenseAlpha(self,gridSize=None):
-        gridSize = self.gridSize if gridSize is None else gridSize
+    def updateAlphaMask(self, gridSize=(200,200,200)):
+
+        total_voxels = gridSize[0] * gridSize[1] * gridSize[2]
 
         samples = torch.stack(torch.meshgrid(
             torch.linspace(0, 1, gridSize[0]),
@@ -310,20 +312,12 @@ class TensorBase(torch.nn.Module):
         ), -1).to(self.device)
         dense_xyz = self.aabb[0] * (1-samples) + self.aabb[1] * samples
 
-        # dense_xyz = dense_xyz
-        # print(self.stepSize, self.distance_scale*self.aabbDiag)
-        alpha = torch.zeros_like(dense_xyz[...,0])
-        for i in range(gridSize[0]):
-            alpha[i] = self.compute_alpha(dense_xyz[i].view(-1,3), self.stepSize).view((gridSize[1], gridSize[2]))
-        return alpha, dense_xyz
-
-    @torch.no_grad()
-    def updateAlphaMask(self, gridSize=(200,200,200)):
-
-        alpha, dense_xyz = self.getDenseAlpha(gridSize)
         dense_xyz = dense_xyz.transpose(0,2).contiguous()
-        alpha = alpha.clamp(0,1).transpose(0,2).contiguous()[None,None]
-        total_voxels = gridSize[0] * gridSize[1] * gridSize[2]
+        alpha = torch.zeros_like(dense_xyz[...,0])
+        for i in range(gridSize[2]):
+            alpha[i] = self.compute_alpha(dense_xyz[i].view(-1,3), self.distance_scale*self.aabbDiag).view((gridSize[1], gridSize[0]))
+        alpha = alpha.clamp(0,1)[None,None]
+
 
         ks = 3
         alpha = F.max_pool3d(alpha, kernel_size=ks, padding=ks // 2, stride=1).view(gridSize[::-1])
@@ -358,6 +352,7 @@ class TensorBase(torch.nn.Module):
             rays_o, rays_d = rays_chunk[..., :3], rays_chunk[..., 3:6]
             if bbox_only:
                 vec = torch.where(rays_d == 0, torch.full_like(rays_d, 1e-6), rays_d)
+                print("aabbtensor",self.aabb)
                 rate_a = (self.aabb[1] - rays_o) / vec
                 rate_b = (self.aabb[0] - rays_o) / vec
                 t_min = torch.minimum(rate_a, rate_b).amax(-1)#.clamp(min=near, max=far)
@@ -370,7 +365,8 @@ class TensorBase(torch.nn.Module):
 
             mask_filtered.append(mask_inbbox.cpu())
 
-        mask_filtered = torch.cat(mask_filtered).view(all_rgbs.shape[:-1])
+        mask_filtered = torch.cat(mask_filtered)
+        mask_filtered = mask_filtered.view(all_rgbs.shape[:-1])
 
         print(f'Ray filtering done! takes {time.time()-tt} s. ray mask ratio: {torch.sum(mask_filtered) / N}')
         return all_rays[mask_filtered], all_rgbs[mask_filtered]
@@ -407,7 +403,8 @@ class TensorBase(torch.nn.Module):
 
 
     def forward(self, rays_chunk, white_bg=True, is_train=False, ndc_ray=False, N_samples=-1):
-
+        #print("rays",rays_chunk)
+        #exit()
         # sample points
         viewdirs = rays_chunk[:, 3:6]
         if ndc_ray:
@@ -433,6 +430,7 @@ class TensorBase(torch.nn.Module):
         rgb = torch.zeros((*xyz_sampled.shape[:2], 3), device=xyz_sampled.device)
 
         if ray_valid.any():
+            #print("valid rays")
             xyz_sampled = self.normalize_coord(xyz_sampled)
             sigma_feature = self.compute_densityfeature(xyz_sampled[ray_valid])
 
