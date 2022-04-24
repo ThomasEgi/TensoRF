@@ -265,12 +265,55 @@ class MeshRoom(Dataset):
             ray_o1 = [ray_o1[0],ray_o1[1],ray_o1[2]]
             #rays_o = []
             
-            bodydata=GeomVertexData("body vertices", GeomVertexFormat.getV3c4() , Geom.UHStatic)
-            bodydata.setNumRows(h*w)
-            vertex = GeomVertexWriter(bodydata, 'vertex')
-            color = GeomVertexWriter(bodydata, 'color')
-            lastpercent = 0
-            pixidx = 0
+            #bodydata=GeomVertexData("body vertices", GeomVertexFormat.getV3c4() , Geom.UHStatic)
+            #bodydata.setNumRows(h*w)
+            #vertex = GeomVertexWriter(bodydata, 'vertex')
+            #color = GeomVertexWriter(bodydata, 'color')
+            #lastpercent = 0
+            #pixidx = 0
+            
+            ###faster way
+            yy, xx = torch.meshgrid(
+                torch.arange(h, dtype=torch.float32) + 0.5, #not sure about the +0.5 technically should get you the center of the pixels i guess? but for real cameras?
+                torch.arange(w, dtype=torch.float32) + 0.5,
+            )
+            xx = (xx - cx) / f #could be fx and fy, if we had both separate.
+            yy = (yy - cy) / f
+            zz = torch.ones_like(xx)
+            
+            
+            #using radial3 model.
+            r2 = xx*xx + yy*yy
+            r4 = r2*r2
+            r6 = r4*r2
+            r =  torch.ones_like(xx) + distlist[0]*r2 + distlist[1]*r4 + distlist[2]*r6
+                
+            #let's skip p1 and p2 parameters
+            #dx = 2*p1*x0*y0 + p2*(r2 + 2*x0*x0) 
+            #dy = p1*(r2 + 2*y0*y0) + 2*p2*x0*y0
+            xx = xx*r#+dx
+            yy = yy*r#+dy
+            #return np.array((x * fx + cx, y * fy + cy))
+            #print(xx,yy)
+            
+            dirs = torch.stack((xx, yy, zz), dim=-1)  # OpenCV convention
+            dirs /= torch.norm(dirs, dim=-1, keepdim=True)
+            dirs = dirs.reshape(1, -1, 3, 1)
+            dirs = (c2w[None,:3,:3]@dirs)[...,0][0]
+            del xx, yy, zz
+            #print(dirs)
+            origins = torch.tensor(ray_o1)
+            origins = origins.repeat(h*w,1)
+            trays = torch.cat((origins,dirs),1)
+            #print(trays)
+            self.all_rays.append(trays)
+            #exit()
+            #print((c2w[None,:3,:3]@dirs)[...,0][0])
+            #exit()
+            #dirs = (c2w[:, None, :3, :3] @ dirs)[..., 0]
+            
+                
+            """
             for py in range(h):
                 if int(10*py/h) != lastpercent:
                     lastpercent = int(10*py/h)
@@ -290,22 +333,19 @@ class MeshRoom(Dataset):
                     color.addData4(c[0],c[1],c[2],.6)
                     #totalidx+=1
                     pixidx+=1
-
+            """
             
-            primitive = GeomPoints(GeomEnums.UH_static)
-            primitive.add_next_vertices(h*w)
-            geom = Geom(bodydata)
-            geom.add_primitive(primitive)
-            gnode = GeomNode('points')
-            gnode.add_geom(geom)
-            dummyRootNP.attachNewNode(gnode)
+            #primitive = GeomPoints(GeomEnums.UH_static)
+            #primitive.add_next_vertices(h*w)
+            #geom = Geom(bodydata)
+            #geom.add_primitive(primitive)
+            #gnode = GeomNode('points')
+            #gnode.add_geom(geom)
+            #dummyRootNP.attachNewNode(gnode)
             
-        self.all_rays = torch.tensor( temprays)  # (h*w, 6)
-            
-            
-            #now we can actually create distorted rays in camera space.. if we wish to do so.
-            #but the fun just begins!
-            
+        self.all_rays = torch.cat(self.all_rays,0)  # (h*w, 6) #merge all the tensors of the individual images into one giant pile.
+        print(self.all_rays)
+        #exit()            
         dummyRootNP.writeBamFile('./testfile_'+self.split+'.bam')
         print(self.all_rgbs)
         print(len(self.all_rgbs))
