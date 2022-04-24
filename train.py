@@ -2,8 +2,8 @@
 import os
 from tqdm.auto import tqdm
 from opt import config_parser
-
-
+import torch
+import numpy
 
 import json, random
 from renderer import *
@@ -37,19 +37,6 @@ class SimpleSampler:
 
 
 @torch.no_grad()
-def export_mesh(args):
-
-    ckpt = torch.load(args.ckpt, map_location=device)
-    kwargs = ckpt['kwargs']
-    kwargs.update({'device': device})
-    tensorf = eval(args.model_name)(**kwargs)
-    tensorf.load(ckpt)
-
-    alpha,_ = tensorf.getDenseAlpha()
-    convert_sdf_samples_to_ply(alpha.cpu(), f'{args.ckpt[:-3]}.ply',bbox=tensorf.aabb.cpu(), level=0.005)
-
-
-@torch.no_grad()
 def render_test(args):
     # init dataset
     dataset = dataset_dict[args.dataset_name]
@@ -67,6 +54,36 @@ def render_test(args):
     tensorf = eval(args.model_name)(**kwargs)
     tensorf.load(ckpt)
 
+    if 0: #compute 3d model
+        resx = 128
+        resy = 128
+        resz = 128
+        densitygrid = numpy.zeros((resx,resy,resz))
+        for x in range(resx):
+            print("Progress:%i %%"%(100*x/resx))
+            xvals = [-0.5+x/float(resx)]*resz
+            xvals = numpy.array(xvals)
+            for y in range(resy):
+                yvals = [-0.5+y/float(resy)]*resz # an array with y-size size and filled with current y value
+                yvals = numpy.array(yvals)
+                #if y< 50 or y>60:
+                #    continue
+                zvals = numpy.array(range(0,resz))/resz
+                zvals = zvals-0.5
+                samplepos = numpy.dstack([xvals,yvals,zvals])[0] #get a full z-line at x,y coords worth of 3d coordinates.
+                samplepos *= 2
+                u = tensorf.compute_densityfeature( torch.tensor(samplepos,dtype=torch.float).to(device=device)) #only get densities, no colors
+                u = tensorf.feature2density(u)
+                v = u.detach().to(device=torch.device("cpu")).numpy() #turn tensor into numpy array.
+                vt = v.T#[0] #turn array from shape (128,1) to (1,128)
+                densitygrid[x,y] = vt #feed the extracted 
+        from matplotlib import pyplot as plt
+        plt.imshow( densitygrid[int(resz/2)], interpolation='nearest')
+        plt.show()
+        import mcubes
+        v,t = mcubes.marching_cubes(densitygrid,1) #adjust value to your scene. start with 0.
+        mcubes.export_obj(v,t,"./testout2.obj")
+                
     logfolder = os.path.dirname(args.ckpt)
     if args.render_train:
         os.makedirs(f'{logfolder}/imgs_train_all', exist_ok=True)
@@ -78,7 +95,7 @@ def render_test(args):
     if args.render_test:
         os.makedirs(f'{logfolder}/{args.expname}/imgs_test_all', exist_ok=True)
         evaluation(test_dataset,tensorf, args, renderer, f'{logfolder}/{args.expname}/imgs_test_all/',
-                                N_vis=-1, N_samples=-1, white_bg = white_bg, ndc_ray=ndc_ray,device=device)
+                                N_vis=-1, N_samples=-1, white_bg = white_bg, ndc_ray=ndc_ray,device=device , compute_extra_metrics=False)
 
     if args.render_path:
         c2ws = test_dataset.render_path
@@ -121,6 +138,7 @@ def reconstruction(args):
     # init parameters
     # tensorVM, renderer = init_parameters(args, train_dataset.scene_bbox.to(device), reso_list[0])
     aabb = train_dataset.scene_bbox.to(device)
+    print("aabb",aabb)
     reso_cur = N_to_reso(args.N_voxel_init, aabb)
     nSamples = min(args.nSamples, cal_n_samples(reso_cur,args.step_ratio))
 
@@ -152,7 +170,7 @@ def reconstruction(args):
 
     #linear in logrithmic space
     N_voxel_list = (torch.round(torch.exp(torch.linspace(np.log(args.N_voxel_init), np.log(args.N_voxel_final), len(upsamp_list)+1))).long()).tolist()[1:]
-
+    print("nvoxlist",N_voxel_list) #just a list with numbers of voxels to use. hand full of integers. nothin fancy
 
     torch.cuda.empty_cache()
     PSNRs,PSNRs_test = [],[0]
@@ -160,6 +178,7 @@ def reconstruction(args):
     allrays, allrgbs = train_dataset.all_rays, train_dataset.all_rgbs
     if not args.ndc_ray:
         allrays, allrgbs = tensorf.filtering_rays(allrays, allrgbs, bbox_only=True)
+    #all fine and candy here.
     trainingSampler = SimpleSampler(allrays.shape[0], args.batch_size)
 
     Ortho_reg_weight = args.Ortho_weight
@@ -171,18 +190,20 @@ def reconstruction(args):
     tvreg = TVLoss()
     print(f"initial TV_weight density: {TV_weight_density} appearance: {TV_weight_app}")
 
-
+    #very little to see up to this point.
     pbar = tqdm(range(args.n_iters), miniters=args.progress_refresh_rate, file=sys.stdout)
     for iteration in pbar:
 
 
         ray_idx = trainingSampler.nextids()
         rays_train, rgb_train = allrays[ray_idx], allrgbs[ray_idx].to(device)
+        #rgb_train gets send to gpu... may be possible to clean it up.
 
         #rgb_map, alphas_map, depth_map, weights, uncertainty
+        #print("\nrenderer", renderer,"\n",tensorf)
         rgb_map, alphas_map, depth_map, weights, uncertainty = renderer(rays_train, tensorf, chunk=args.batch_size,
                                 N_samples=nSamples, white_bg = white_bg, ndc_ray=ndc_ray, device=device, is_train=True)
-
+        rgb_map = rgb_map.to(device=rgb_train.device)
         loss = torch.mean((rgb_map - rgb_train) ** 2)
 
 
@@ -232,8 +253,9 @@ def reconstruction(args):
             )
             PSNRs = []
 
-
-        if iteration % args.vis_every == args.vis_every - 1 and args.N_vis!=0:
+        #print("\n",iteration , args.vis_every,iteration % args.vis_every,args.vis_every - 1 )
+        if iteration % args.vis_every == args.vis_every - 1:
+            print("\n evaluating!")
             PSNRs_test = evaluation(test_dataset,tensorf, args, renderer, f'{logfolder}/imgs_vis/', N_vis=args.N_vis,
                                     prtx=f'{iteration:06d}_', N_samples=nSamples, white_bg = white_bg, ndc_ray=ndc_ray, compute_extra_metrics=False)
             summary_writer.add_scalar('test/psnr', np.mean(PSNRs_test), global_step=iteration)
@@ -302,15 +324,11 @@ def reconstruction(args):
 if __name__ == '__main__':
 
     torch.set_default_dtype(torch.float32)
-    torch.manual_seed(20211202)
-    np.random.seed(20211202)
+    torch.manual_seed(20121202)
+    np.random.seed(20121202)
 
     args = config_parser()
     print(args)
-
-    if  args.export_mesh:
-        export_mesh(args)
-
     if args.render_only and (args.render_test or args.render_path):
         render_test(args)
     else:
